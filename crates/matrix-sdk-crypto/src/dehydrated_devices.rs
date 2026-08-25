@@ -306,7 +306,12 @@ impl RehydratedDevice {
 
         trace!(room_key_count = room_keys.len(), "Collected room keys from the rehydrated device");
 
-        self.original.store().save_inbound_group_sessions(room_keys).await?;
+        let original_changes = Changes {
+            inbound_group_sessions: room_keys.clone(),
+            received_room_key_bundles: changes.received_room_key_bundles.clone(),
+            ..Default::default()
+        };
+        self.original.store().save_changes(original_changes).await?;
 
         rehydrated_transaction.commit().await?;
         self.rehydrated.store().save_changes(changes).await?;
@@ -403,26 +408,29 @@ impl DehydratedDevice {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, iter};
+    use std::{collections::BTreeMap, iter, sync::Arc};
 
     use js_option::JsOption;
     use matrix_sdk_test::async_test;
     use ruma::{
-        DeviceId, RoomId, TransactionId, UserId,
+        DeviceId, OwnedMxcUri, RoomId, TransactionId, UserId,
         api::client::{
             dehydrated_device::put_dehydrated_device,
             keys::get_keys::v3::Response as KeysQueryResponse,
         },
         assign,
         encryption::DeviceKeys,
-        events::AnyToDeviceEvent,
-        room_id,
+        events::{
+            AnyToDeviceEvent,
+            room::{EncryptedFile, V2EncryptedFileInfo},
+        },
+        owned_room_id, room_id,
         serde::Raw,
         user_id,
     };
 
     use crate::{
-        DecryptionSettings, EncryptionSettings, OlmMachine, TrustRequirement,
+        CollectStrategy, DecryptionSettings, EncryptionSettings, OlmMachine, TrustRequirement,
         dehydrated_devices::DehydratedDevice,
         machine::{
             test_helpers::{create_session, get_prepared_machine_test_helper},
@@ -430,7 +438,10 @@ mod tests {
         },
         olm::OutboundGroupSession,
         store::types::DehydratedDeviceKey,
-        types::{DeviceKeys as DeviceKeysType, events::ToDeviceEvent},
+        types::{
+            DeviceKeys as DeviceKeysType,
+            events::{ToDeviceEvent, room_key_bundle::RoomKeyBundleContent},
+        },
         utilities::json_convert,
     };
 
@@ -600,6 +611,85 @@ mod tests {
             room_key.session_id(),
             group_session.session_id(),
             "The session ids of the imported room key and the outbound group session should match"
+        );
+    }
+
+    #[async_test]
+    async fn test_dehydrated_device_rehydration_preserves_room_key_bundle() {
+        let room_id = owned_room_id!("!test:example.org");
+        let alice = get_olm_machine().await;
+
+        let dehydrated_device = alice.dehydrated_devices().create().await.unwrap();
+        let mut request = dehydrated_device
+            .keys_for_upload("Foo".to_owned(), &pickle_key())
+            .await
+            .expect("We should be able to create a request to upload a dehydrated device");
+
+        let (key_id, one_time_key) = request
+            .one_time_keys
+            .pop_first()
+            .expect("The dehydrated device creation request should contain a one-time key");
+
+        receive_device_keys(&alice, user_id(), &request.device_id, request.device_keys).await;
+        create_session(&alice, user_id(), &request.device_id, key_id, one_time_key).await;
+
+        let bundle_data = RoomKeyBundleContent {
+            room_id: room_id.clone(),
+            file: EncryptedFile::new(
+                OwnedMxcUri::from("mxc://example.org/history"),
+                V2EncryptedFileInfo::encode([0; 32], [0; 16]).into(),
+                Default::default(),
+            ),
+        };
+        let to_device_requests = alice
+            .share_room_key_bundle_data(
+                user_id(),
+                &CollectStrategy::OnlyTrustedDevices,
+                bundle_data,
+            )
+            .await
+            .expect("We should be able to encrypt the room key bundle");
+        let event = ToDeviceEvent::new(
+            user_id().to_owned(),
+            to_device_requests_to_content(to_device_requests.into_iter().map(Arc::new).collect()),
+        );
+        let event = json_convert(&event)
+            .expect("We should be able to convert the to-device event into its Raw variant");
+
+        let bob = get_olm_machine().await;
+        let rehydrated = bob
+            .dehydrated_devices()
+            .rehydrate(&pickle_key(), &request.device_id, request.device_data)
+            .await
+            .expect("We should be able to rehydrate the device");
+
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        rehydrated
+            .receive_events(vec![event], &decryption_settings)
+            .await
+            .expect("We should be able to process the room key bundle");
+
+        let rehydrated_bundle = rehydrated
+            .rehydrated
+            .store()
+            .get_received_room_key_bundle_data(&room_id, user_id())
+            .await
+            .expect("We should be able to read the rehydrated device store");
+        assert!(
+            rehydrated_bundle.is_some(),
+            "The rehydrated device should process the room key bundle"
+        );
+
+        let stored_bundle = bob
+            .store()
+            .get_received_room_key_bundle_data(&room_id, user_id())
+            .await
+            .expect("We should be able to read the original device store");
+
+        assert!(
+            stored_bundle.is_some(),
+            "The original device should retain room key bundle data received by the dehydrated device"
         );
     }
 
