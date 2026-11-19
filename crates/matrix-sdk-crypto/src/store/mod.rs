@@ -1749,9 +1749,30 @@ impl Store {
         progress_listener: impl Fn(usize, usize),
     ) -> Result<(), CryptoStoreError> {
         let sender_data = if bundle_info.sender_data.should_recalculate() {
-            let device = self
+            let device = match self
                 .get_device_from_curve_key(&bundle_info.sender_user, bundle_info.sender_key)
-                .await?;
+                .await?
+            {
+                Some(device) => Some(device),
+                // The sending device may have been deleted since it sent the bundle, e.g.
+                // when the bundle reached us through a dehydrated device. The device keys
+                // stored with the bundle still show whether its owner's identity signed it.
+                None => match &bundle_info.sender_data {
+                    SenderData::DeviceInfo { device_keys, .. } => {
+                        match DeviceData::try_from(device_keys) {
+                            Ok(device_data)
+                                if device_data.user_id() == bundle_info.sender_user
+                                    && device_data.curve25519_key()
+                                        == Some(bundle_info.sender_key) =>
+                            {
+                                Some(self.wrap_device_data(device_data).await?)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+            };
 
             device
                 .as_ref()
@@ -1973,20 +1994,20 @@ mod tests {
     use matrix_sdk_test::async_test;
     use rand::RngExt;
     use ruma::{
-        RoomId, device_id,
+        RoomId, TransactionId, device_id,
         events::room::{EncryptedFile, EncryptedFileHashes, V2EncryptedFileInfo},
         owned_device_id, owned_mxc_uri, room_id, user_id,
     };
     use serde_json::json;
-    use vodozemac::{Ed25519Keypair, megolm::SessionKey};
+    use vodozemac::{Curve25519PublicKey, Ed25519Keypair, megolm::SessionKey};
 
     use crate::{
         Account, OlmMachine,
-        machine::test_helpers::get_machine_pair,
+        machine::test_helpers::{bootstrap_requests_to_keys_query_response, get_machine_pair},
         olm::{InboundGroupSession, SenderData},
         store::types::{DehydratedDeviceKey, RoomKeyWithheldEntry, StoredRoomKeyBundleData},
         types::{
-            EventEncryptionAlgorithm,
+            DeviceKeys, EventEncryptionAlgorithm,
             events::{
                 room_key_bundle::RoomKeyBundleContent,
                 room_key_withheld::{MegolmV1AesSha2WithheldContent, RoomKeyWithheldContent},
@@ -2091,7 +2112,7 @@ mod tests {
             sender_account.identity_keys.ed25519,
             room_id,
             &make_session_key(signing_key),
-            SenderData::device_info(crate::types::DeviceKeys::new(
+            SenderData::device_info(DeviceKeys::new(
                 sender_account.user_id().to_owned(),
                 sender_account.device_id().to_owned(),
                 vec![],
@@ -2472,6 +2493,39 @@ mod tests {
         );
     }
 
+    /// The device that sent a bundle may be deleted before we import the
+    /// bundle, e.g. when the bundle reached us through a dehydrated device.
+    /// The bundle is still accepted if the device keys stored with it are
+    /// signed by the sender's cross-signing identity.
+    #[async_test]
+    async fn test_receive_room_key_bundle_from_deleted_sender_device() {
+        let (alice, bob, _, signed_device_keys) = machines_with_deleted_sender_device().await;
+        let alice_key = alice.identity_keys().curve25519;
+
+        let imported =
+            receive_shared_history_bundle(&alice, &bob, alice_key, signed_device_keys).await;
+
+        assert_eq!(imported, 1);
+    }
+
+    #[async_test]
+    async fn test_receive_room_key_bundle_from_deleted_sender_device_needs_trusted_keys() {
+        let (alice, bob, unsigned_device_keys, signed_device_keys) =
+            machines_with_deleted_sender_device().await;
+        let alice_key = alice.identity_keys().curve25519;
+        let bob_key = bob.identity_keys().curve25519;
+
+        // Device keys that Alice's identity did not sign.
+        let imported =
+            receive_shared_history_bundle(&alice, &bob, alice_key, unsigned_device_keys).await;
+        assert_eq!(imported, 0);
+
+        // Device keys that belong to a different device than the one that sent the bundle.
+        let imported =
+            receive_shared_history_bundle(&alice, &bob, bob_key, signed_device_keys).await;
+        assert_eq!(imported, 0);
+    }
+
     /// Tests that the new store format introduced in [#5737][#5737] does not
     /// conflict with items already in the store that were serialised with the
     /// older format.
@@ -2548,5 +2602,79 @@ mod tests {
             shared_history,
         )
         .unwrap()
+    }
+
+    /// Bob knows Alice's cross-signing identity, but her device is no longer on
+    /// the server. Returns Alice's device keys without and with her identity's
+    /// signature.
+    async fn machines_with_deleted_sender_device()
+    -> (OlmMachine, OlmMachine, DeviceKeys, DeviceKeys) {
+        let alice = OlmMachine::new(user_id!("@a:s.co"), device_id!("ALICE")).await;
+        let bob = OlmMachine::new(user_id!("@b:s.co"), device_id!("BOB")).await;
+
+        let unsigned_device_keys = alice
+            .get_device(alice.user_id(), alice.device_id(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_device_keys()
+            .clone();
+
+        let bootstrap_requests = alice.bootstrap_cross_signing(false).await.unwrap();
+        let mut kq_response = bootstrap_requests_to_keys_query_response(bootstrap_requests);
+        let signed_device_keys: DeviceKeys = kq_response
+            .device_keys
+            .remove(alice.user_id())
+            .and_then(|mut devices| devices.remove(alice.device_id()))
+            .unwrap()
+            .deserialize_as_unchecked()
+            .unwrap();
+
+        bob.update_tracked_users([alice.user_id()]).await.unwrap();
+        bob.mark_request_as_sent(&TransactionId::new(), &kq_response).await.unwrap();
+
+        (alice, bob, unsigned_device_keys, signed_device_keys)
+    }
+
+    /// Bob imports a bundle with one shared-history room key from Alice, sent by
+    /// the given device. Returns how many room keys Bob holds for the room.
+    async fn receive_shared_history_bundle(
+        alice: &OlmMachine,
+        bob: &OlmMachine,
+        sender_key: Curve25519PublicKey,
+        sender_device_keys: DeviceKeys,
+    ) -> usize {
+        let room_id = room_id!("!room1:localhost");
+        let session = create_inbound_group_session_with_visibility(
+            alice,
+            room_id,
+            &make_session_key(&Ed25519Keypair::new()),
+            true,
+        );
+        alice.store().save_inbound_group_sessions(&[session]).await.unwrap();
+        let bundle = alice.store().build_room_key_bundle(room_id).await.unwrap();
+
+        bob.store()
+            .receive_room_key_bundle(
+                &StoredRoomKeyBundleData {
+                    sender_user: alice.user_id().to_owned(),
+                    sender_key,
+                    sender_data: SenderData::device_info(sender_device_keys),
+                    bundle_data: RoomKeyBundleContent {
+                        room_id: room_id.to_owned(),
+                        file: EncryptedFile::new(
+                            owned_mxc_uri!("mxc://example.com/0"),
+                            V2EncryptedFileInfo::encode([0; 32], [0; 16]).into(),
+                            EncryptedFileHashes::with_sha256([0; 32]),
+                        ),
+                    },
+                },
+                bundle,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+
+        bob.store().get_inbound_group_sessions_by_room_id(room_id).await.unwrap().len()
     }
 }
